@@ -1,0 +1,8 @@
+.git
+.gitignore
+.github
+LICENSE
+Dockerfile
+.golangci.yml
+.goreleaser.yaml
+statuspage-exporter

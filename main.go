@@ -2,86 +2,80 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
-	echoPrometheus "github.com/labstack/echo-contrib/prometheus"
-	"github.com/labstack/echo/v4"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/version"
-	"go.uber.org/zap"
-
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sergeyshevch/statuspage-exporter/pkg/config"
 	"github.com/sergeyshevch/statuspage-exporter/pkg/prober"
+	"go.uber.org/zap"
 )
 
 const (
-	shutdownTimeout = 5 * time.Second
+	shutdownTimeout   = 5 * time.Second
+	readHeaderTimeout = 10 * time.Second
 )
 
-func handleHealthz(ctx echo.Context) error {
-	return ctx.String(http.StatusOK, "ok")
-}
+func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(),
+		syscall.SIGINT,
+		syscall.SIGKILL,
+		syscall.SIGTERM,
+	)
+	defer cancel()
 
-func startHTTP(ctx context.Context, wg *sync.WaitGroup, log *zap.Logger) {
-	wg.Add(1)
-	defer wg.Done()
+	log, err := config.InitConfig()
+	if err != nil {
+		log.Error("Unable to initialize config", zap.Error(err))
+		return
+	}
 
-	srv := echo.New()
-	echoPrometheus := echoPrometheus.NewPrometheus("statuspage_exporter", nil)
-	echoPrometheus.Use(srv)
+	prometheus.MustRegister(collectors.NewBuildInfoCollector())
 
-	srv.GET("/probe", prober.Handler(log))
-	srv.GET("/healthz", handleHealthz)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /probe", prober.Handler(log))
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.Handle(`GET /metrics`, promhttp.HandlerFor(
+		prometheus.DefaultGatherer,
+		promhttp.HandlerOpts{
+			Registry: prometheus.DefaultRegisterer,
+		}))
 
-	httpPort := config.HTTPPort()
-	httpAddr := fmt.Sprintf(":%d", httpPort)
+	srv := &http.Server{
+		Addr:              fmt.Sprintf(":%d", config.HTTPPort()),
+		Handler:           mux,
+		ReadHeaderTimeout: readHeaderTimeout,
+	}
 
 	// Start your http server for prometheus.
 	go func() {
-		if err := srv.Start(httpAddr); err != nil {
-			log.Panic("Unable to start a http server.", zap.Error(err))
+		log.Info("Http server listening on", zap.String("addr", srv.Addr))
+
+		serverErr := srv.ListenAndServe()
+		if serverErr != nil && !errors.Is(serverErr, http.ErrServerClosed) {
+			log.Panic("Unable to start a http server.", zap.Error(serverErr))
 		}
 	}()
 
-	log.Info("Http server listening on", zap.Int("port", httpPort))
-
 	<-ctx.Done()
+	log.Info("Received shutdown signal. Waiting for workers to terminate...")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
 
-	if err := srv.Shutdown(shutdownCtx); err != nil { //nolint:contextcheck
+	err = srv.Shutdown(shutdownCtx)
+	if err != nil {
 		log.Panic("Http server Shutdown Failed", zap.Error(err))
 	}
 
 	log.Info("Http server stopped")
-}
-
-func main() {
-	log, err := config.InitConfig()
-	if err != nil {
-		log.Fatal("Unable to initialize config", zap.Error(err))
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	wg := &sync.WaitGroup{}
-
-	prometheus.MustRegister(version.NewCollector("statuspage_exporter"))
-
-	go startHTTP(ctx, wg, log)
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	<-quit
-	log.Info("Received shutdown signal. Waiting for workers to terminate...")
-	cancel()
-
-	wg.Wait()
 }

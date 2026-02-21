@@ -1,7 +1,7 @@
 package engines
 
 import (
-	"fmt"
+	"errors"
 
 	"github.com/go-resty/resty/v2"
 	"github.com/prometheus/client_golang/prometheus"
@@ -13,7 +13,7 @@ import (
 	"github.com/sergeyshevch/statuspage-exporter/pkg/engines/types"
 )
 
-var errUnknownStatusPageType = fmt.Errorf("unknown statuspage type")
+var errUnknownStatusPageType = errors.New("unknown statuspage type")
 
 // FetchStatus detect statuspage type and fetch its status.
 func FetchStatus(
